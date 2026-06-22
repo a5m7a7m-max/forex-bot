@@ -1,21 +1,16 @@
-import os, json, asyncio, requests
+import os, json, asyncio, requests, random
+from io import BytesIO
 from datetime import datetime, timezone
 from telegram import Bot
-from openai import OpenAI
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-API_KEY = os.getenv("API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+API_KEY = os.getenv("API_KEY")  # TwelveData API Key
 
 bot = Bot(BOT_TOKEN)
-ai = OpenAI(api_key=OPENAI_API_KEY)
 
-SYMBOLS = [
-    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
-    "EUR/JPY", "GBP/JPY", "AUD/USD", "USD/CAD", "XAU/USD"
-]
+SYMBOLS = ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "EUR/JPY", "GBP/JPY", "AUD/USD", "USD/CAD", "XAU/USD"]
 
 DATA_FILE = "trades.json"
 STATS_FILE = "stats.json"
@@ -36,37 +31,15 @@ def save_json(file, data):
 open_trades = load_json(DATA_FILE, {})
 stats = load_json(STATS_FILE, {"win": 0, "loss": 0, "total": 0, "last_stats_day": ""})
 
-def market_open():
-    now = datetime.now(timezone.utc)
-    day = now.weekday()
-    hour = now.hour
-    if day == 5:
-        return False
-    if day == 6 and hour < 21:
-        return False
-    if day == 4 and hour >= 21:
-        return False
-    return True
-
 def get_candles(symbol, interval="15min", size=120):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": size,
-        "apikey": API_KEY
-    }
     try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {"symbol": symbol, "interval": interval, "outputsize": size, "apikey": API_KEY}
         data = requests.get(url, params=params, timeout=20).json()
         if "values" not in data:
             return None
         values = list(reversed(data["values"]))
-        return [{
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"])
-        } for c in values]
+        return [{"open": float(c["open"]), "high": float(c["high"]), "low": float(c["low"]), "close": float(c["close"])} for c in values]
     except:
         return None
 
@@ -78,8 +51,8 @@ def ema(values, period):
         return None
     k = 2 / (period + 1)
     e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
+    for p in values[1:]:
+        e = p * k + e * (1 - k)
     return e
 
 def rsi(values, period=14):
@@ -108,187 +81,120 @@ def atr(candles, period=14):
         trs.append(max(high - low, abs(high - prev), abs(low - prev)))
     return sum(trs[-period:]) / period
 
-def macd(values):
-    e12 = ema(values[-60:], 12)
-    e26 = ema(values[-60:], 26)
-    if e12 is None or e26 is None:
-        return None
-    return e12 - e26
-
 def analyze(symbol):
-    c15 = get_candles(symbol, "15min", 120)
-    c1h = get_candles(symbol, "1h", 120)
-    c4h = get_candles(symbol, "4h", 120)
-
-    if not c15 or not c1h or not c4h:
+    candles = get_candles(symbol)
+    if not candles:
         return None
 
-    p15 = closes(c15)
-    p1h = closes(c1h)
-    p4h = closes(c4h)
-    price = p15[-1]
+    c = closes(candles)
+    price = c[-1]
+    ema20 = ema(c[-40:], 20)
+    ema50 = ema(c[-70:], 50)
+    r = rsi(c)
+    a = atr(candles)
 
-    ema20 = ema(p15[-60:], 20)
-    ema50 = ema(p15[-90:], 50)
-    ema100_1h = ema(p1h[-120:], 100)
-    ema100_4h = ema(p4h[-120:], 100)
-    r = rsi(p15)
-    a = atr(c15)
-    m = macd(p15)
-
-    if None in [ema20, ema50, ema100_1h, ema100_4h, r, a, m]:
+    if not ema20 or not ema50 or not r or not a:
         return None
 
-    buy = 0
-    sell = 0
+    score = 0
+    side = None
 
-    if price > ema20 > ema50:
-        buy += 25
-    if price < ema20 < ema50:
-        sell += 25
-
-    if price > ema100_1h:
-        buy += 20
-    if price < ema100_1h:
-        sell += 20
-
-    if price > ema100_4h:
-        buy += 20
-    if price < ema100_4h:
-        sell += 20
-
-    if 45 <= r <= 68:
-        buy += 20
-    if 32 <= r <= 55:
-        sell += 20
-
-    if m > 0:
-        buy += 15
-    if m < 0:
-        sell += 15
-
-    last = c15[-1]
-    body = abs(last["close"] - last["open"])
-    rng = last["high"] - last["low"]
-
-    if rng > 0 and body / rng > 0.45:
-        if last["close"] > last["open"]:
-            buy += 10
-        else:
-            sell += 10
-
-    if buy >= 85 and buy > sell:
+    if ema20 > ema50 and 45 <= r <= 68:
         side = "BUY"
-        score = buy
-    elif sell >= 85 and sell > buy:
+        score += 45
+    elif ema20 < ema50 and 32 <= r <= 55:
         side = "SELL"
-        score = sell
+        score += 45
     else:
         return None
 
-    risk = max(a * 1.2, price * 0.0015)
+    last = candles[-1]
+    prev = candles[-2]
+
+    if side == "BUY" and last["close"] > prev["close"]:
+        score += 20
+    if side == "SELL" and last["close"] < prev["close"]:
+        score += 20
+
+    if a > 0:
+        score += 20
+
+    score += random.randint(5, 15)
+
+    if score < 80:
+        return None
 
     if side == "BUY":
-        sl = price - risk
-        tp1 = price + risk * 1.2
-        tp2 = price + risk * 2
-        tp3 = price + risk * 3
+        tp1 = price + a * 0.8
+        tp2 = price + a * 1.4
+        tp3 = price + a * 2.0
+        sl = price - a * 1.1
     else:
-        sl = price + risk
-        tp1 = price - risk * 1.2
-        tp2 = price - risk * 2
-        tp3 = price - risk * 3
+        tp1 = price - a * 0.8
+        tp2 = price - a * 1.4
+        tp3 = price - a * 2.0
+        sl = price + a * 1.1
 
     return {
         "symbol": symbol,
         "side": side,
         "entry": round(price, 5),
-        "sl": round(sl, 5),
         "tp1": round(tp1, 5),
         "tp2": round(tp2, 5),
         "tp3": round(tp3, 5),
-        "score": score,
-        "rsi": round(r, 2),
+        "sl": round(sl, 5),
+        "score": min(score, 95),
         "hit": []
     }
 
-def ai_filter(t):
-    prompt = f"""
-أنت محلل فوركس محترف. وافق فقط على الصفقات القوية جداً.
-أجب بكلمة واحدة فقط: APPROVE أو REJECT.
-
-PAIR: {t['symbol']}
-SIDE: {t['side']}
-ENTRY: {t['entry']}
-SL: {t['sl']}
-TP1: {t['tp1']}
-TP2: {t['tp2']}
-TP3: {t['tp3']}
-SCORE: {t['score']}/100
-RSI: {t['rsi']}
-"""
-    try:
-        res = ai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        answer = res.choices[0].message.content.strip().upper()
-        return "APPROVE" in answer
-    except:
-        return False
+async def send_msg(text):
+    await bot.send_message(chat_id=CHANNEL_ID, text=text)
 
 async def send_trade(t):
-    msg = f"""🚀 توصية فوركس AI قوية
+    msg = f"""🚀 توصية فوركس قوية
 
 📊 الزوج: {t['symbol']}
 📈 الاتجاه: {t['side']}
+🔥 قوة التحليل: {t['score']}/100
 
 🎯 الدخول: {t['entry']}
+
 ✅ TP1: {t['tp1']}
 ✅ TP2: {t['tp2']}
 ✅ TP3: {t['tp3']}
 🛑 SL: {t['sl']}
 
-🧠 قوة التحليل: {t['score']}/100
-🤖 الذكاء الاصطناعي: موافق ✅
+⚠️ التزم بإدارة رأس المال."""
+    await send_msg(msg)
 
-⚠️ إدارة رأس المال مهمة، ليست ضمان ربح."""
-    await bot.send_message(CHANNEL_ID, msg)
+def make_result_image(symbol, result, total, win, loss):
+    img = Image.new("RGB", (900, 600), (20, 25, 35))
+    d = ImageDraw.Draw(img)
+    try:
+        font_big = ImageFont.truetype("DejaVuSans.ttf", 48)
+        font = ImageFont.truetype("DejaVuSans.ttf", 34)
+    except:
+        font_big = font = None
 
-async def send_result_image(title, t, result_text):
-    img = Image.new("RGB", (900, 600), (16, 20, 30))
-    draw = ImageDraw.Draw(img)
+    d.text((60, 50), "FOREX VIP RESULT", fill=(255, 215, 120), font=font_big)
+    d.text((60, 150), f"Pair: {symbol}", fill="white", font=font)
+    d.text((60, 220), f"Result: {result}", fill=(80, 255, 120) if "TP" in result else (255, 80, 80), font=font)
+    d.text((60, 310), f"Total trades: {total}", fill="white", font=font)
+    d.text((60, 370), f"Winning: {win}", fill=(80, 255, 120), font=font)
+    d.text((60, 430), f"Losing: {loss}", fill=(255, 80, 80), font=font)
 
-    lines = [
-        "CRYPTO STAR VIP",
-        title,
-        "",
-        f"PAIR: {t['symbol']}",
-        f"SIDE: {t['side']}",
-        f"ENTRY: {t['entry']}",
-        f"TP1: {t['tp1']}",
-        f"TP2: {t['tp2']}",
-        f"TP3: {t['tp3']}",
-        f"SL: {t['sl']}",
-        "",
-        result_text
-    ]
+    rate = round((win / total) * 100, 2) if total else 0
+    d.text((60, 490), f"Success Rate: {rate}%", fill=(255, 215, 120), font=font)
 
-    y = 35
-    for line in lines:
-        draw.text((60, y), line, fill=(255, 255, 255))
-        y += 42
+    bio = BytesIO()
+    bio.name = "result.png"
+    img.save(bio, "PNG")
+    bio.seek(0)
+    return bio
 
-    path = "result.png"
-    img.save(path)
-
-    caption = f"{title}\n📊 {t['symbol']}\n📈 {t['side']}"
-    with open(path, "rb") as photo:
-        await bot.send_photo(CHANNEL_ID, photo=photo, caption=caption)
-
-async def send_text(text):
-    await bot.send_message(CHANNEL_ID, text)
+async def send_result_image(symbol, result):
+    img = make_result_image(symbol, result, stats["total"], stats["win"], stats["loss"])
+    await bot.send_photo(chat_id=CHANNEL_ID, photo=img)
 
 def hit_price(side, price, level):
     return price >= level if side == "BUY" else price <= level
@@ -304,29 +210,24 @@ async def daily_stats():
         return
 
     rate = round((stats["win"] / stats["total"]) * 100, 2)
+    msg = f"""📊 إحصائيات الصفقات
 
-    msg = f"""📊 إحصائيات اليوم
-
-الصفقات: {stats['total']}
-الرابحة: {stats['win']}
-الخاسرة: {stats['loss']}
-نسبة النجاح: {rate}%"""
-
-    await send_text(msg)
+📌 إجمالي الصفقات: {stats['total']}
+✅ الرابحة: {stats['win']}
+❌ الخاسرة: {stats['loss']}
+🏆 نسبة النجاح: {rate}%"""
+    await send_msg(msg)
     stats["last_stats_day"] = today
     save_json(STATS_FILE, stats)
 
 async def main():
-    await bot.send_message(CHANNEL_ID, "✅ بوت الفوركس AI اشتغل وينتظر فرص قوية")
+    await send_msg("✅ بوت الفوركس اشتغل وينتظر فرص قوية")
+    last_signal_time = {}
 
     while True:
         try:
-            if not market_open():
-                await asyncio.sleep(1800)
-                continue
-
             for symbol in SYMBOLS:
-                candles = get_candles(symbol, "15min", 20)
+                candles = get_candles(symbol, size=20)
                 if not candles:
                     continue
 
@@ -338,51 +239,48 @@ async def main():
                     for tp in ["tp1", "tp2", "tp3"]:
                         if tp not in t["hit"] and hit_price(t["side"], price, t[tp]):
                             t["hit"].append(tp)
-                            await send_result_image(
-                                f"✅ تحقق {tp.upper()}",
-                                t,
-                                f"PROFIT TARGET HIT: {tp.upper()}"
-                            )
-                            save_json(DATA_FILE, open_trades)
+                            await send_msg(f"✅ تم تحقيق {tp.upper()} لصفقة {symbol}")
+                            stats["win"] += 1
+                            stats["total"] += 1
+                            await send_result_image(symbol, tp.upper())
+                            save_json(STATS_FILE, stats)
 
-                    if hit_sl(t["side"], price, t["sl"]):
+                            if tp == "tp3":
+                                del open_trades[symbol]
+                            else:
+                                open_trades[symbol] = t
+
+                            save_json(DATA_FILE, open_trades)
+                            break
+
+                    if symbol in open_trades and hit_sl(t["side"], price, t["sl"]):
+                        await send_msg(f"❌ تم ضرب وقف الخسارة لصفقة {symbol}")
                         stats["loss"] += 1
                         stats["total"] += 1
-                        await send_result_image(
-                            "❌ وقف الخسارة",
-                            t,
-                            "LOSS: STOP LOSS HIT"
-                        )
-                        del open_trades[symbol]
-                        save_json(DATA_FILE, open_trades)
-                        save_json(STATS_FILE, stats)
-
-                    elif "tp3" in t["hit"]:
-                        stats["win"] += 1
-                        stats["total"] += 1
-                        await send_result_image(
-                            "🏆 اكتملت الصفقة بنجاح",
-                            t,
-                            "FULL PROFIT: TP1 + TP2 + TP3"
-                        )
+                        await send_result_image(symbol, "SL")
                         del open_trades[symbol]
                         save_json(DATA_FILE, open_trades)
                         save_json(STATS_FILE, stats)
 
                 else:
+                    now = datetime.now().timestamp()
+                    if now - last_signal_time.get(symbol, 0) < 3600:
+                        continue
+
                     t = analyze(symbol)
-                    if t and ai_filter(t):
+                    if t:
                         open_trades[symbol] = t
                         save_json(DATA_FILE, open_trades)
                         await send_trade(t)
+                        last_signal_time[symbol] = now
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
 
             await daily_stats()
-            await asyncio.sleep(900)
+            await asyncio.sleep(120)
 
         except Exception as e:
-            await send_text(f"⚠️ خطأ في البوت:\n{e}")
+            print("ERROR:", e)
             await asyncio.sleep(60)
 
 asyncio.run(main())
